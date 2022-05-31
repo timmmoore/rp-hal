@@ -355,8 +355,7 @@ impl core::fmt::Write for FmtBuf {
 // 
 fn init_wifi(wifi: &mut Wifiuart, timer: &Timer) -> u32 {
     // connect ESP8266 to wifi
-    //let cmd1 = "AT+CWJAP=\"DUMMYSSID\",\"DUMMYPASSWORD\"";
-    let cmd1 = "AT+CWJAP=\"MS1155\",\"11111111\"";
+    let cmd1 = "AT+CWJAP=\"DUMMYSSID\",\"DUMMYPASSWORD\"";
     let mut fail = 0;
 
     if send_cmd(wifi, "AT", "OK", &timer, 2000) == false {
@@ -437,8 +436,7 @@ fn send_cmd(wifi: &mut Wifiuart, cmd: &str, ack: &str, timer: &Timer, timeout:u3
 }
 
 fn send_remote(wifi: &mut Wifiuart, timer: &Timer, pm1: u16, pm2_5: u16, pm10: u16, temp: f32, pres: f32, hum: f32, gfail: u32) -> u32 {
-    //let api_key = "DUMMYAPIKEY";    //write your API Key
-    let api_key = "74N3N3YP5XUZIJWD";    //write your API Key
+    let api_key = "DUMMYAPIKEY";    //write your API Key
     let cmd2 = "AT+CIPSTART=\"TCP\",\"184.106.153.149\",80";
     let cmd3 = "AT+CIPCLOSE";
     let mut buf = FmtBuf::new();
