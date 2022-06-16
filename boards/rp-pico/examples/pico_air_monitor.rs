@@ -58,6 +58,12 @@ use bme280::BME280;
 
 use pms_7003::*;
 
+//use si7021::Si7021;
+
+use sgp40::*;
+
+use shtcx::*;
+
 /// Import the GPIO pins we use
 use hal::gpio::pin::bank0::{Gpio4, Gpio5};
 
@@ -161,7 +167,27 @@ fn main() -> ! {
             fail += 32;
         }
     }
+    let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS);
 
+    let mut delay = timer.count_down();
+    let mut sensor = Sgp40::new(bus.acquire_i2c(), 0x59, &mut delay);
+    
+    let mut nosht = true;
+    let mut sht = shtcx::shtc3(bus.acquire_i2c());
+    let mut idfail = 0;
+    match sht.device_identifier() {
+        Ok(_) => {
+            nosht = false;
+        }
+        Err(shtcx::Error::Crc) => {
+            idfail = 1;
+        }
+        Err(shtcx::Error::I2c(_)) => {
+            idfail = 2;
+        }
+    }
+    
+    //let mut si7021 = Si7021::new(bus.acquire_i2c());
     // particle monitor
     // init serial and device
     let air_uart_pins = (
@@ -171,7 +197,6 @@ fn main() -> ! {
         pins.gpio1.into_mode::<hal::gpio::FunctionUart>(),
     );
 
-    let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS);
 
     let air_uart = hal::uart::UartPeripheral::new(pac.UART0, air_uart_pins, &mut pac.RESETS)
         .enable(
@@ -185,9 +210,9 @@ fn main() -> ! {
     // ESP8266
     // init serial and device
     let wifi_uart_pins = (
-        // UART TX (characters sent from RP2040) on pin 1 (GPIO4)
+        // UART TX (characters sent from RP2040) on pin 6 (GPIO4)
         pins.gpio4.into_mode::<hal::gpio::FunctionUart>(),
-        // UART RX (characters received by RP2040) on pin 2 (GPIO5)
+        // UART RX (characters received by RP2040) on pin 7 (GPIO5)
         pins.gpio5.into_mode::<hal::gpio::FunctionUart>(),
     );
 
@@ -211,10 +236,12 @@ fn main() -> ! {
     let mut pm1 = 0;
     let mut pm2_5 = 0;
     let mut pm10 = 0;
-    let mut pmfail : u32;
+    let mut pmfail : u32 = 0;
     let mut temp = 0.0;
     let mut pres = 0.0;
     let mut hum = 0.0;
+    let mut voc: u16 = 0;
+    let mut vocinit = false;
     loop {
         // Empty the display:
         display.clear();
@@ -240,11 +267,54 @@ fn main() -> ! {
         }
         // Format info into buffer and draw on LCD
         buf.reset();
-        write!(&mut buf, "Pres: {:.2}    {}", pres, fail).unwrap();
+        write!(&mut buf, "Pres: {:.2}  {}", pres, fail+(pmfail*10)+(idfail*100)).unwrap();
         Text::with_baseline(buf.as_str(), Point::new(0, 0), text_style, Baseline::Top)
             .draw(&mut display)
             .unwrap();
-
+        pmfail = 0;
+        
+        if nosht == false {
+            //pmfail = 0;
+            match sht.start_wakeup() {
+                Ok(()) => {}
+                Err(_) => {
+                    pmfail = 18;
+                }
+            }
+            delay.start(3_u32.milliseconds());
+            let _ = nb::block!(delay.wait());
+            match sht.start_measurement(PowerMode::NormalMode) {
+                Ok(()) => {}
+                Err(_) => {
+                    pmfail = 17;
+                }
+            }
+            delay.start(20_u32.milliseconds());
+            let _ = nb::block!(delay.wait());
+            for _ in 1..20 {
+                match sht.get_measurement_result() {
+                    Ok(measurement) => {
+                        temp = measurement.temperature.as_degrees_celsius();
+                        hum = measurement.humidity.as_percent();
+                        break;
+                    }
+                    Err(shtcx::Error::Crc) => {
+                        pmfail = 14;
+                        delay.start(1_u32.milliseconds());
+                        let _ = nb::block!(delay.wait());
+                    }
+                    Err(shtcx::Error::I2c(_)) => {
+                        pmfail = 15;
+                        delay.start(1_u32.milliseconds());
+                        let _ = nb::block!(delay.wait());
+                    }
+                }
+            }
+        }
+        else {
+            pmfail = 19;
+        }
+        
         // Format info into buffer and draw on LCD
         buf.reset();
         write!(&mut buf, "Temp: {:.2}, Hum: {}", temp, hum).unwrap();
@@ -259,7 +329,6 @@ fn main() -> ! {
                 pm1 = frame.pm1_0;
                 pm2_5 = frame.pm2_5;
                 pm10 = frame.pm10;
-                pmfail = 0;
             },
             Err(pms_7003::Error::SendFailed) => {
                 pmfail = 8;               
@@ -277,9 +346,17 @@ fn main() -> ! {
                 pmfail = 12;               
             },
         }
+        match sensor.measure_voc_index() {
+            Ok(result) => {
+                voc = result;
+            }
+            Err(_) => {
+                pmfail = 13;
+            }
+        }
         // Format info into buffer and draw on LCD
         buf.reset();
-        write!(&mut buf, "Air: {} {} {}", pm1, pm2_5, pm10).unwrap();
+        write!(&mut buf, "Air: {} {} {} {}", pm1, pm2_5, pm10, voc).unwrap();
         Text::with_baseline(buf.as_str(), Point::new(0, 20), text_style, Baseline::Top)
             .draw(&mut display)
             .unwrap();
@@ -287,11 +364,29 @@ fn main() -> ! {
         display.flush().unwrap();
 
         // send data to thingspeak.com
-        fail = send_remote(&mut wifi_uart, &timer, pm1, pm2_5, pm10, temp, pres, hum, fail);
-        fail += pmfail;
-        // Wait a bit:
-        delay.start(mainloopdelay.milliseconds());
-        let _ = nb::block!(delay.wait());
+        fail = send_remote(&mut wifi_uart, &timer, pm1, pm2_5, pm10, temp, pres, hum, voc, fail+(pmfail*10)+(idfail*100));
+
+        // while voc is starting up (first 45 redings at 1sec intervals) use loop delay time to continue its startup
+        // note first loop delay will be 45sec rather than normal delay (20sec)
+        if vocinit == false {
+            for _ in 1..45 {
+                match sensor.measure_voc_index() {
+                    Ok(result) => {
+                        voc = result;
+                    }
+                    Err(_) => {
+                    }
+                }
+                delay.start(1000u32.milliseconds());
+                let _ = nb::block!(delay.wait());
+            }
+            vocinit = true;
+        }
+        else {
+            // Wait a bit:
+            delay.start(mainloopdelay.milliseconds());
+            let _ = nb::block!(delay.wait());
+        }
     }
 }
 
@@ -333,29 +428,37 @@ impl core::fmt::Write for FmtBuf {
     }
 }
 
-//fn setup_i2c(pins: rp_pico::Pins, pac: pac::Peripherals, clocks: rp2040_hal::clocks::ClocksManager) -> &'static shared_bus::BusManager<shared_bus::NullMutex<hal::I2C>> {
+/*
+use rp2040_hal::I2C;
+use hal::gpio::pin::bank0::{Gpio20, Gpio21};
+type SdaPint = hal::gpio::Pin<Gpio20, hal::gpio::Function<hal::gpio::I2C>>;
+type SclPint = hal::gpio::Pin<Gpio21, hal::gpio::Function<hal::gpio::I2C>>;
+
+fn setup_i2c(pins: rp_pico::Pins, pac: pac::Peripherals, clocks: rp2040_hal::clocks::ClocksManager) -> &'static shared_bus::BusManagerSimple<I2C<<pac::Peripherals>::I2C0, SdaPint, SclPint>> {
     // Configure two pins as being I²C, not GPIO
-//    let sda_pin = pins.gpio20.into_mode::<hal::gpio::FunctionI2C>();
-//    let scl_pin = pins.gpio21.into_mode::<hal::gpio::FunctionI2C>();
+    let sda_pin = pins.gpio20.into_mode::<hal::gpio::FunctionI2C>();
+    let scl_pin = pins.gpio21.into_mode::<hal::gpio::FunctionI2C>();
 
     // Create the I²C driver, using the two pre-configured pins. This will fail
     // at compile time if the pins are in the wrong mode, or if this I²C
     // peripheral isn't available on these pins!
-//    let i2c = hal::I2C::i2c0(
-//        pac.I2C0,
-//        sda_pin,
-//        scl_pin,
-//        400.kHz(),  
-//        &mut pac.RESETS,
-//        clocks.peripheral_clock,
-//    );
+    let i2c = hal::I2C::i2c0(
+        pac.I2C0,
+        sda_pin,
+        scl_pin,
+        400.kHz(),  
+        &mut pac.RESETS,
+        clocks.peripheral_clock,
+    );
     // create shared bus for I2C
-//    shared_bus::BusManagerSimple::new(i2c)
-//}
+    shared_bus::BusManagerSimple::new(i2c)
+}
+*/
 // 
 fn init_wifi(wifi: &mut Wifiuart, timer: &Timer) -> u32 {
     // connect ESP8266 to wifi
-    let cmd1 = "AT+CWJAP=\"DUMMYSSID\",\"DUMMYPASSWORD\"";
+    //let cmd1 = "AT+CWJAP=\"DUMMYSSID\",\"DUMMYPASSWORD\"";
+    let cmd1 = "AT+CWJAP=\"MS1155\",\"11111111\"";
     let mut fail = 0;
 
     if send_cmd(wifi, "AT", "OK", &timer, 2000) == false {
@@ -435,8 +538,9 @@ fn send_cmd(wifi: &mut Wifiuart, cmd: &str, ack: &str, timer: &Timer, timeout:u3
     }
 }
 
-fn send_remote(wifi: &mut Wifiuart, timer: &Timer, pm1: u16, pm2_5: u16, pm10: u16, temp: f32, pres: f32, hum: f32, gfail: u32) -> u32 {
-    let api_key = "DUMMYAPIKEY";    //write your API Key
+fn send_remote(wifi: &mut Wifiuart, timer: &Timer, pm1: u16, pm2_5: u16, pm10: u16, temp: f32, pres: f32, hum: f32, voc: u16, gfail: u32) -> u32 {
+    //let api_key = "DUMMYAPIKEY";    //write your API Key
+    let api_key = "74N3N3YP5XUZIJWD";    //write your API Key
     let cmd2 = "AT+CIPSTART=\"TCP\",\"184.106.153.149\",80";
     let cmd3 = "AT+CIPCLOSE";
     let mut buf = FmtBuf::new();
@@ -444,7 +548,7 @@ fn send_remote(wifi: &mut Wifiuart, timer: &Timer, pm1: u16, pm2_5: u16, pm10: u
     let mut fail = 0;
 
     buf.reset();
-    write!(&mut buf, "GET /update?key={}&field1={}&field2={}&field3={}&field4={}&field5={}&field6={}&field7={}\r\n\r\n",
+    write!(&mut buf, "GET /update?key={}&field1={}&field2={}&field3={}&field4={}&field5={}&field6={}&field7={}&field8={}\r\n\r\n",
         api_key,
         pm1,
         pm2_5,
@@ -452,6 +556,7 @@ fn send_remote(wifi: &mut Wifiuart, timer: &Timer, pm1: u16, pm2_5: u16, pm10: u
         temp,
         pres,
         hum,
+        voc,
         gfail).unwrap();
 
     // Connect to thingspeak server

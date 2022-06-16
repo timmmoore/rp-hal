@@ -37,6 +37,10 @@ bme280 = { path = "../../../bme280-rs" }
 shared-bus = "0.2.3"
 pms-7003 = { path = "../../../pms-7003" }
 # pms-7003 = { git = "https://github.com/timmmoore/pms-7003" }
+sgp40 = { path = "../../../sgp40-rs" }
+shtcx = "0.10.0"
+#si7021 = { path = "../../../si7021-rs" }
+
 
 defmt = "0.2.0"
 defmt-rtt = "0.2.0"
