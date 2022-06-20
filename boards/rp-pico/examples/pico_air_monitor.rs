@@ -55,13 +55,11 @@ use shared_bus;
 use ssd1306::{prelude::*, Ssd1306};
 // pressure, temp, humity
 use bme280::BME280;
-
+// air monitor
 use pms_7003::*;
-
-//use si7021::Si7021;
-
+// voc
 use sgp40::*;
-
+// temp, humidity
 use shtcx::*;
 
 /// Import the GPIO pins we use
@@ -73,6 +71,35 @@ type Wifiuartpins = (
 );/// Alias the type for our wifi UART to make things clearer.
 type Wifiuart = hal::uart::UartPeripheral<hal::uart::Enabled, hal::pac::UART1, Wifiuartpins>;
 
+#[derive(Copy, Clone)]
+enum DeviceError {
+    Bmp280Unidentified = 1,
+    Bmp280Error = 2,
+    ShtcxIdCrc = 3,
+    ShtcxIdI2c = 4,
+    Bmp280MeasureError = 5,
+    ShtcxWakeupError = 6,
+    ShtcxStartMeasurementError = 7,
+    ShtcxGetMeasurementCrcError = 8,
+    ShtcxGetMeasurementI2cError = 9,
+    Pms7003SendFailed = 10,
+    Pms7003ReadFailed = 11,
+    Pms7003ChecksumError = 12,
+    Pms7003IncorrectResponse = 13,
+    Pms7003NoResponse = 14,               
+    Sgp40MeasureVocIndexError = 15,
+    WifiConnectError = 16,
+    WifiSendError = 17,
+    WifiDisconnectError = 18,
+    WifiATError = 19,
+    WifiStationError = 20,
+    WifiSSIDError = 21,
+    WifiIPAddressError = 22,
+}
+
+fn error_code(code: DeviceError) -> u32 {
+    1 << (code as u8)
+}
 /// Entry point to our bare-metal application.
 ///
 /// The `#[entry]` macro ensures the Cortex-M start-up code calls this function
@@ -119,7 +146,7 @@ fn main() -> ! {
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
-//    let bus = setup_i2c(pins, pac, clocks);
+    //let bus = setup_i2c(pins, pac, clocks);
     // Configure two pins as being I²C, not GPIO
     let sda_pin = pins.gpio20.into_mode::<hal::gpio::FunctionI2C>();
     let scl_pin = pins.gpio21.into_mode::<hal::gpio::FunctionI2C>();
@@ -154,40 +181,41 @@ fn main() -> ! {
         .text_color(BinaryColor::On)
         .build();
 
+    let mut fail: u32 = 0;
+
     // Create I2C BME280 - temperature, pressure and humidity sensor
-    let mut fail = 0;
     let delayp = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().integer());
     let mut bme280 = BME280::new_primary(bus.acquire_i2c(), delayp);
     match bme280.init() {
         Ok(()) => {}
         Err(bme280::Error::UnsupportedChip) => {
-            fail += 16;
+            fail += error_code(DeviceError::Bmp280Unidentified);
         }
         Err(_) => {
-            fail += 32;
+            fail += error_code(DeviceError::Bmp280Error);
         }
     }
-    let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS);
 
+    // sgp40
+    let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS);
     let mut delay = timer.count_down();
     let mut sensor = Sgp40::new(bus.acquire_i2c(), 0x59, &mut delay);
     
+    // shtc3
     let mut nosht = true;
     let mut sht = shtcx::shtc3(bus.acquire_i2c());
-    let mut idfail = 0;
     match sht.device_identifier() {
         Ok(_) => {
             nosht = false;
         }
         Err(shtcx::Error::Crc) => {
-            idfail = 1;
+            fail += error_code(DeviceError::ShtcxIdCrc);
         }
         Err(shtcx::Error::I2c(_)) => {
-            idfail = 2;
+            fail += error_code(DeviceError::ShtcxIdI2c);
         }
     }
     
-    //let mut si7021 = Si7021::new(bus.acquire_i2c());
     // particle monitor
     // init serial and device
     let air_uart_pins = (
@@ -196,8 +224,6 @@ fn main() -> ! {
         // UART RX (characters received by RP2040) on pin 2 (GPIO1)
         pins.gpio1.into_mode::<hal::gpio::FunctionUart>(),
     );
-
-
     let air_uart = hal::uart::UartPeripheral::new(pac.UART0, air_uart_pins, &mut pac.RESETS)
         .enable(
             hal::uart::common_configs::_9600_8_N_1,
@@ -207,7 +233,7 @@ fn main() -> ! {
 
     let mut airsensor = Pms7003Sensor::new(air_uart);
 
-    // ESP8266
+    // ESP8266 wifi
     // init serial and device
     let wifi_uart_pins = (
         // UART TX (characters sent from RP2040) on pin 6 (GPIO4)
@@ -226,71 +252,73 @@ fn main() -> ! {
     // initialize the ESP8266 and connect to Thingspeak
     fail += init_wifi(&mut wifi_uart, &timer);
 
-    // Set the LED to be an output
+    // Set the LED to be an output for errors
     let mut led_pin = pins.led.into_push_pull_output();
 
     let mut delay = timer.count_down();
 
     // buffer for text for lcd
     let mut buf = FmtBuf::new();
+
     let mut pm1 = 0;
     let mut pm2_5 = 0;
     let mut pm10 = 0;
-    let mut pmfail : u32 = 0;
     let mut temp = 0.0;
     let mut pres = 0.0;
     let mut hum = 0.0;
     let mut voc: u16 = 0;
     let mut vocinit = false;
     loop {
-        // Empty the display:
+        // Clear the display:
         display.clear();
 
-        let measurements = bme280.measure();
-        match measurements {
-            Ok(measurements) => {
-                temp = measurements.temperature;
-                pres = measurements.pressure;
-                hum = measurements.humidity;
-            },
-            Err(_) => {
-                fail += 13;
-            },
-        }
-
-        // if there is a problem with esp8266 turn led on
+        // if there is a problem with any device then led on
         if fail != 0 {
             led_pin.set_high().unwrap();
         }
         else {
             led_pin.set_low().unwrap();
         }
+
+        let measurements = bme280.measure();
+        match measurements {
+            Ok(measurements) => {
+                pres = measurements.pressure;
+                temp = measurements.temperature;
+                hum = measurements.humidity;
+            },
+            Err(_) => {
+                fail += error_code(DeviceError::Bmp280MeasureError);
+            },
+        }
         // Format info into buffer and draw on LCD
         buf.reset();
-        write!(&mut buf, "Pres: {:.2}  {}", pres, fail+(pmfail*10)+(idfail*100)).unwrap();
+        write!(&mut buf, "Pres:{:.1} {:01x}", pres, fail).unwrap();
         Text::with_baseline(buf.as_str(), Point::new(0, 0), text_style, Baseline::Top)
             .draw(&mut display)
             .unwrap();
-        pmfail = 0;
-        
+
+        // overides bmp280 for temp and humidity if available
         if nosht == false {
-            //pmfail = 0;
             match sht.start_wakeup() {
                 Ok(()) => {}
                 Err(_) => {
-                    pmfail = 18;
+                    fail += error_code(DeviceError::ShtcxWakeupError);
                 }
             }
+            // 3 milliseconds to wakeup
             delay.start(3_u32.milliseconds());
             let _ = nb::block!(delay.wait());
             match sht.start_measurement(PowerMode::NormalMode) {
                 Ok(()) => {}
                 Err(_) => {
-                    pmfail = 17;
+                    fail += error_code(DeviceError::ShtcxStartMeasurementError);
                 }
             }
+            // 14.5 mullisecond to respond
             delay.start(20_u32.milliseconds());
             let _ = nb::block!(delay.wait());
+            // if error wait 1 millsecond and try again
             for _ in 1..20 {
                 match sht.get_measurement_result() {
                     Ok(measurement) => {
@@ -299,30 +327,26 @@ fn main() -> ! {
                         break;
                     }
                     Err(shtcx::Error::Crc) => {
-                        pmfail = 14;
+                        fail += error_code(DeviceError::ShtcxGetMeasurementCrcError);
                         delay.start(1_u32.milliseconds());
                         let _ = nb::block!(delay.wait());
                     }
                     Err(shtcx::Error::I2c(_)) => {
-                        pmfail = 15;
+                        fail += error_code(DeviceError::ShtcxGetMeasurementI2cError);
                         delay.start(1_u32.milliseconds());
                         let _ = nb::block!(delay.wait());
                     }
                 }
             }
         }
-        else {
-            pmfail = 19;
-        }
-        
         // Format info into buffer and draw on LCD
         buf.reset();
-        write!(&mut buf, "Temp: {:.2}, Hum: {}", temp, hum).unwrap();
+        write!(&mut buf, "Temp:{:.2}, Hum:{:.2}", temp, hum).unwrap();
         Text::with_baseline(buf.as_str(), Point::new(0, 10), text_style, Baseline::Top)
             .draw(&mut display)
             .unwrap();
 
-        // Get info from particle sensor
+        // Get info from air particle sensor
         match airsensor.read(&timer) {
             Ok(frame) => {
                 // update if available
@@ -331,27 +355,29 @@ fn main() -> ! {
                 pm10 = frame.pm10;
             },
             Err(pms_7003::Error::SendFailed) => {
-                pmfail = 8;               
+                fail += error_code(DeviceError::Pms7003SendFailed);
             },
             Err(pms_7003::Error::ReadFailed) => {
-                pmfail = 9;               
+                fail += error_code(DeviceError::Pms7003ReadFailed);
             },
             Err(pms_7003::Error::ChecksumError) => {
-                pmfail = 10;               
+                fail += error_code(DeviceError::Pms7003ChecksumError);
             },
             Err(pms_7003::Error::IncorrectResponse) => {
-                pmfail = 11;               
+                fail += error_code(DeviceError::Pms7003IncorrectResponse);
             },
             Err(pms_7003::Error::NoResponse) => {
-                pmfail = 12;               
+                fail += error_code(DeviceError::Pms7003NoResponse);
             },
         }
+
+        // get voc index
         match sensor.measure_voc_index() {
             Ok(result) => {
                 voc = result;
             }
             Err(_) => {
-                pmfail = 13;
+                fail += error_code(DeviceError::Sgp40MeasureVocIndexError);
             }
         }
         // Format info into buffer and draw on LCD
@@ -364,7 +390,7 @@ fn main() -> ! {
         display.flush().unwrap();
 
         // send data to thingspeak.com
-        fail = send_remote(&mut wifi_uart, &timer, pm1, pm2_5, pm10, temp, pres, hum, voc, fail+(pmfail*10)+(idfail*100));
+        fail = send_remote(&mut wifi_uart, &timer, pm1, pm2_5, pm10, temp, pres, hum, voc, fail);
 
         // while voc is starting up (first 45 redings at 1sec intervals) use loop delay time to continue its startup
         // note first loop delay will be 45sec rather than normal delay (20sec)
@@ -393,14 +419,14 @@ fn main() -> ! {
 /// This is a very simple buffer to pre format a short line of text
 /// limited arbitrarily to 128 bytes.
 struct FmtBuf {
-    buf: [u8; 128],
+    buf: [u8; 256],
     ptr: usize,
 }
 
 impl FmtBuf {
     fn new() -> Self {
         Self {
-            buf: [0; 128],
+            buf: [0; 256],
             ptr: 0,
         }
     }
@@ -462,19 +488,19 @@ fn init_wifi(wifi: &mut Wifiuart, timer: &Timer) -> u32 {
     let mut fail = 0;
 
     if send_cmd(wifi, "AT", "OK", &timer, 2000) == false {
-        fail += 1;
+        fail += error_code(DeviceError::WifiATError);
     }
     // switch to station mode
     if send_cmd(wifi, "AT+CWMODE=1","OK", &timer, 2000) == false {
-        fail += 2;
+        fail += error_code(DeviceError::WifiStationError);
     }
     // connect to wifi SSID
-    if send_cmd(wifi, cmd1,"OK", &timer, 20000) == false {
-        fail += 4;
+    if send_cmd(wifi, cmd1, "OK", &timer, 20000) == false {
+        fail += error_code(DeviceError::WifiSSIDError);
     }
     // get ip address
-    if send_cmd(wifi, "AT+CIFSR","OK", &timer, 2000) == false {
-        fail += 8;
+    if send_cmd(wifi, "AT+CIFSR", "OK", &timer, 2000) == false {
+        fail += error_code(DeviceError::WifiIPAddressError);
     }
     fail
 }
@@ -561,13 +587,13 @@ fn send_remote(wifi: &mut Wifiuart, timer: &Timer, pm1: u16, pm2_5: u16, pm10: u
 
     // Connect to thingspeak server
     if send_cmd(wifi, cmd2, "OK", &timer, 10000) == false {
-        fail += 1;
+        fail += error_code(DeviceError::WifiConnectError);
     }
     // Send the data length
     cmdbuf.reset();
     write!(&mut cmdbuf, "AT+CIPSEND={}\r\n", buf.ptr).unwrap();
     if send_cmd(wifi, cmdbuf.as_str(), "OK", &timer, 2000) == false {
-        fail += 2
+        fail += error_code(DeviceError::WifiSendError);
     }
     // if connection and length header ok, then send data
     if fail == 0 {
@@ -577,7 +603,7 @@ fn send_remote(wifi: &mut Wifiuart, timer: &Timer, pm1: u16, pm2_5: u16, pm10: u
     else {
         // close the tcp connection
         if send_cmd(wifi, cmd3, "OK", &timer, 5000) == false {
-            fail += 4
+            fail += error_code(DeviceError::WifiDisconnectError);
         }
     }
     fail
