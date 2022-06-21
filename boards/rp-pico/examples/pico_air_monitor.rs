@@ -18,9 +18,6 @@ use embedded_time::rate::Extensions;
 
 // CountDown timer for the counter on the display:
 use embedded_hal::timer::CountDown;
-use rp2040_hal::Timer;
-
-use embedded_hal::prelude::_embedded_hal_serial_Read;
 
 // Ensure we halt the program on panic (if we don't mention this crate it won't
 // be linked)
@@ -62,47 +59,17 @@ use sgp40::*;
 // temp, humidity
 use shtcx::*;
 
-/// Import the GPIO pins we use
-use hal::gpio::pin::bank0::{Gpio4, Gpio5};
+mod device;
+mod wifi;
+mod fmtbuf;
 
-mod air_config;
+//type Wifiuartpins = (
+//    hal::gpio::Pin<Gpio4, hal::gpio::Function<hal::gpio::Uart>>,
+//    hal::gpio::Pin<Gpio5, hal::gpio::Function<hal::gpio::Uart>>,
+//);/// Alias the type for our wifi UART to make things clearer.
+//type Wifiuart = hal::uart::UartPeripheral<hal::uart::Enabled, hal::pac::UART1, Wifiuartpins>;
 
-type Wifiuartpins = (
-    hal::gpio::Pin<Gpio4, hal::gpio::Function<hal::gpio::Uart>>,
-    hal::gpio::Pin<Gpio5, hal::gpio::Function<hal::gpio::Uart>>,
-);/// Alias the type for our wifi UART to make things clearer.
-type Wifiuart = hal::uart::UartPeripheral<hal::uart::Enabled, hal::pac::UART1, Wifiuartpins>;
 
-// types of device failures
-#[derive(Copy, Clone)]
-enum DeviceError {
-    Bmp280Unidentified = 1,
-    Bmp280Error = 2,
-    ShtcxIdCrc = 3,
-    ShtcxIdI2c = 4,
-    Bmp280MeasureError = 5,
-    ShtcxWakeupError = 6,
-    ShtcxStartMeasurementError = 7,
-    ShtcxGetMeasurementCrcError = 8,
-    ShtcxGetMeasurementI2cError = 9,
-    Pms7003SendFailed = 10,
-    Pms7003ReadFailed = 11,
-    Pms7003ChecksumError = 12,
-    Pms7003IncorrectResponse = 13,
-    Pms7003NoResponse = 14,               
-    Sgp40MeasureVocIndexError = 15,
-    WifiConnectError = 16,
-    WifiSendError = 17,
-    WifiDisconnectError = 18,
-    WifiATError = 19,
-    WifiStationError = 20,
-    WifiSSIDError = 21,
-    WifiIPAddressError = 22,
-}
-
-fn error_code(code: DeviceError) -> u32 {
-    1 << (code as u8)
-}
 /// Entry point to our bare-metal application.
 ///
 /// The `#[entry]` macro ensures the Cortex-M start-up code calls this function
@@ -191,10 +158,10 @@ fn main() -> ! {
     match bme280.init() {
         Ok(()) => {}
         Err(bme280::Error::UnsupportedChip) => {
-            fail += error_code(DeviceError::Bmp280Unidentified);
+            fail += device::error_code(device::DeviceError::Bmp280Unidentified);
         }
         Err(_) => {
-            fail += error_code(DeviceError::Bmp280Error);
+            fail += device::error_code(device::DeviceError::Bmp280Error);
         }
     }
 
@@ -208,10 +175,10 @@ fn main() -> ! {
     match sht.device_identifier() {
         Ok(_) => {}
         Err(shtcx::Error::Crc) => {
-            fail += error_code(DeviceError::ShtcxIdCrc);
+            fail += device::error_code(device::DeviceError::ShtcxIdCrc);
         }
         Err(shtcx::Error::I2c(_)) => {
-            fail += error_code(DeviceError::ShtcxIdI2c);
+            fail += device::error_code(device::DeviceError::ShtcxIdI2c);
         }
     }
     
@@ -249,7 +216,7 @@ fn main() -> ! {
         .unwrap();
 
     // initialize the ESP8266 and connect to Thingspeak
-    fail += init_wifi(&mut wifi_uart, &timer);
+    fail += wifi::init_wifi(&mut wifi_uart, &timer);
 
     // Set the LED to be an output for errors
     let mut led_pin = pins.led.into_push_pull_output();
@@ -257,7 +224,7 @@ fn main() -> ! {
     let mut delay = timer.count_down();
 
     // buffer for text for lcd
-    let mut buf = FmtBuf::new();
+    let mut buf = fmtbuf::FmtBuf::new();
 
     let mut pm1 = 0;
     let mut pm2_5 = 0;
@@ -280,14 +247,14 @@ fn main() -> ! {
                 hum = measurements.humidity;
             },
             Err(_) => {
-                fail += error_code(DeviceError::Bmp280MeasureError);
+                fail += device::error_code(device::DeviceError::Bmp280MeasureError);
             },
         }
         // overides bmp280 for temp and humidity if available
         match sht.start_wakeup() {
             Ok(()) => {}
             Err(_) => {
-                fail += error_code(DeviceError::ShtcxWakeupError);
+                fail += device::error_code(device::DeviceError::ShtcxWakeupError);
             }
         }
         // 3 milliseconds to wakeup
@@ -295,7 +262,7 @@ fn main() -> ! {
         match sht.start_measurement(PowerMode::NormalMode) {
             Ok(()) => {}
             Err(_) => {
-                fail += error_code(DeviceError::ShtcxStartMeasurementError);
+                fail += device::error_code(device::DeviceError::ShtcxStartMeasurementError);
             }
         }
         // 14.5 mullisecond to respond
@@ -309,11 +276,11 @@ fn main() -> ! {
                     break;
                 }
                 Err(shtcx::Error::Crc) => {
-                    fail += error_code(DeviceError::ShtcxGetMeasurementCrcError);
+                    fail += device::error_code(device::DeviceError::ShtcxGetMeasurementCrcError);
                     pause(&mut delay, 1);
                 }
                 Err(shtcx::Error::I2c(_)) => {
-                    fail += error_code(DeviceError::ShtcxGetMeasurementI2cError);
+                    fail += device::error_code(device::DeviceError::ShtcxGetMeasurementI2cError);
                     pause(&mut delay, 1);
                 }
             }
@@ -327,19 +294,19 @@ fn main() -> ! {
                 pm10 = frame.pm10;
             },
             Err(pms_7003::Error::SendFailed) => {
-                fail += error_code(DeviceError::Pms7003SendFailed);
+                fail += device::error_code(device::DeviceError::Pms7003SendFailed);
             },
             Err(pms_7003::Error::ReadFailed) => {
-                fail += error_code(DeviceError::Pms7003ReadFailed);
+                fail += device::error_code(device::DeviceError::Pms7003ReadFailed);
             },
             Err(pms_7003::Error::ChecksumError) => {
-                fail += error_code(DeviceError::Pms7003ChecksumError);
+                fail += device::error_code(device::DeviceError::Pms7003ChecksumError);
             },
             Err(pms_7003::Error::IncorrectResponse) => {
-                fail += error_code(DeviceError::Pms7003IncorrectResponse);
+                fail += device::error_code(device::DeviceError::Pms7003IncorrectResponse);
             },
             Err(pms_7003::Error::NoResponse) => {
-                fail += error_code(DeviceError::Pms7003NoResponse);
+                fail += device::error_code(device::DeviceError::Pms7003NoResponse);
             },
         }
         // get voc index using current temperature and humidity
@@ -348,7 +315,7 @@ fn main() -> ! {
                 voc = result;
             }
             Err(_) => {
-                fail += error_code(DeviceError::Sgp40MeasureVocIndexError);
+                fail += device::error_code(device::DeviceError::Sgp40MeasureVocIndexError);
             }
         }
 
@@ -375,7 +342,7 @@ fn main() -> ! {
         display.flush().unwrap();
 
         // send data to thingspeak.com
-        fail = send_remote(&mut wifi_uart, &timer, pm1, pm2_5, pm10, temp, pres, hum, voc, fail);
+        fail = wifi::send_remote(&mut wifi_uart, &timer, pm1, pm2_5, pm10, temp, pres, hum, voc, fail);
 
         // delay before the next measurement
         // while voc is starting up (first 45 redings at 1sec intervals) use this time to continue its startup
@@ -391,44 +358,6 @@ fn main() -> ! {
             // Wait a bit:
             pause(&mut delay, mainloopdelay);
         }
-    }
-}
-
-/// This is a very simple buffer to pre format a short line of text
-/// limited arbitrarily to 256 bytes - more than enough for the send to thingspeak.
-struct FmtBuf {
-    buf: [u8; 256],
-    ptr: usize,
-}
-
-impl FmtBuf {
-    fn new() -> Self {
-        Self {
-            buf: [0; 256],
-            ptr: 0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.ptr = 0;
-    }
-
-    fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.buf[0..self.ptr]).unwrap()
-    }
-}
-
-impl core::fmt::Write for FmtBuf {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let rest_len = self.buf.len() - self.ptr;
-        let len = if rest_len < s.len() {
-            rest_len
-        } else {
-            s.len()
-        };
-        self.buf[self.ptr..(self.ptr + len)].copy_from_slice(&s.as_bytes()[0..len]);
-        self.ptr += len;
-        Ok(())
     }
 }
 
@@ -467,134 +396,4 @@ fn setup_i2c(pins: rp_pico::Pins, pac: pac::Peripherals, clocks: rp2040_hal::clo
 }
 */
 // 
-fn init_wifi(wifi: &mut Wifiuart, timer: &Timer) -> u32 {
-    // connect ESP8266 to wifi
-    //let cmd1 = "AT+CWJAP=\"DUMMYSSID\",\"DUMMYPASSWORD\"";
-    let mut buf = FmtBuf::new();
-    let mut fail = 0;
-
-    if send_cmd(wifi, "AT", "OK", &timer, 2000) == false {
-        fail += error_code(DeviceError::WifiATError);
-    }
-    // switch to station mode
-    if send_cmd(wifi, "AT+CWMODE=1","OK", &timer, 2000) == false {
-        fail += error_code(DeviceError::WifiStationError);
-    }
-    // connect to wifi SSID
-    buf.reset();
-    write!(&mut buf, "AT+CWJAP=\"{}\",\"{}\"",
-        air_config::get_config(air_config::Config::SSID),
-        air_config::get_config(air_config::Config::PASSWORD)).unwrap();
-    if send_cmd(wifi, buf.as_str(), "OK", &timer, 20000) == false {
-        fail += error_code(DeviceError::WifiSSIDError);
-    }
-    // get ip address
-    if send_cmd(wifi, "AT+CIFSR", "OK", &timer, 2000) == false {
-        fail += error_code(DeviceError::WifiIPAddressError);
-    }
-    fail
-}
-
-fn send_cmd(wifi: &mut Wifiuart, cmd: &str, ack: &str, timer: &Timer, timeout:u32) -> bool {
-    let mut buf: [u8; 100] = [0; 100];
-    let mut index: usize = 0;
-
-    wifi.write_full_blocking(cmd.as_bytes());
-    wifi.write_full_blocking(b"\r\n");
-    // start the timeout
-    let mut delaywifi = timer.count_down();
-    delaywifi.start(timeout.milliseconds());
-    'delayloop: loop {
-        match delaywifi.wait() {
-            // still waiting for timeout
-            Err(_) => {
-                // non-blocking read
-                match wifi.read() {
-                    Ok(byte) => {
-                        // end of command
-                        if byte == b'\r' {
-                            // length incorrect, ignore line
-                            if ack.len() != index { index = 0; continue; }
-                            let ackbytes = ack.as_bytes();
-                            let mut i = 0;
-                            for b in ackbytes.iter() {
-                                // char not correct
-                                if *b != buf[i] {
-                                    index = 0;
-                                    // break out of for loop
-                                    continue 'delayloop;
-                                }
-                                i += 1;
-                            }
-                            // all correct
-                            if i == index  { return true; }
-                            // no match, ignore line
-                            index = 0;
-                        }
-                        //ignore end of line
-                        else if byte != b'\n' {
-                            buf[index] = byte;
-                            index += 1;
-                        }
-                        // too long a line, ignore and restart line
-                        if index == buf.len() {
-                            index = 0;
-                            continue;
-                        }
-                    },
-                    // ignore error, rely on the timeout
-                    _ => {}
-                }
-            },
-            // timeout
-            Ok(()) => {
-                return false;
-            }
-        }
-    }
-}
-
-fn send_remote(wifi: &mut Wifiuart, timer: &Timer, pm1: u16, pm2_5: u16, pm10: u16, temp: f32, pres: f32, hum: f32, voc: u16, gfail: u32) -> u32 {
-    //let api_key = "DUMMYAPIKEY";    //write your API Key
-    let api_key = air_config::get_config(air_config::Config::APIKEY);    //write your API Key
-    let cmd2 = "AT+CIPSTART=\"TCP\",\"184.106.153.149\",80";
-    let cmd3 = "AT+CIPCLOSE";
-    let mut buf = FmtBuf::new();
-    let mut cmdbuf = FmtBuf::new();
-    let mut fail = 0;
-
-    buf.reset();
-    write!(&mut buf, "GET /update?key={}&field1={}&field2={}&field3={}&field4={}&field5={}&field6={}&field7={}&field8={}\r\n\r\n",
-        api_key,
-        pm1,
-        pm2_5,
-        pm10,
-        temp,
-        pres,
-        hum,
-        voc,
-        gfail).unwrap();
-
-    // Connect to thingspeak server
-    if send_cmd(wifi, cmd2, "OK", &timer, 10000) == false {
-        fail += error_code(DeviceError::WifiConnectError);
-    }
-    else {
-        // Send the data length
-        cmdbuf.reset();
-        write!(&mut cmdbuf, "AT+CIPSEND={}\r\n", buf.ptr).unwrap();
-        if send_cmd(wifi, cmdbuf.as_str(), "OK", &timer, 2000) == false {
-            fail += error_code(DeviceError::WifiSendError);
-            // close the tcp connection
-            if send_cmd(wifi, cmd3, "OK", &timer, 5000) == false {
-                fail += error_code(DeviceError::WifiDisconnectError);
-            }
-        }
-        else {
-            // send the data
-            wifi.write_full_blocking(&buf.buf[0..buf.ptr]);
-        }
-    }
-    fail
-}
 // End of file
